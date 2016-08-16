@@ -9,11 +9,15 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
+#include <sensor_msgs/LaserScan.h>
 #include <tf/transform_listener.h>
 #include <uav_local_planner/controller.h>
 #include <string>
 
 // TODO: add local planner collision avoidance
+#define QUADRAD 0.65
+#define DISTANCE(x1, x2, y1, y2, z1, z2) sqrt((x1-x2)*(x1-x2) + (y1-y2)*(y1-y2) + (z1-z2)*(z1-z2))
+#define PI 3.14159265358979323846
 
 class UAVLocalPlanner
 {
@@ -50,11 +54,18 @@ private:
         geometry_msgs::PoseStamped& pose,
         geometry_msgs::TwistStamped& velocity);
 
+    float inline quad(float a, float b, float c);
+    bool willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose target);
+
     void pathCallback(nav_msgs::PathConstPtr path);
     void goalCallback(geometry_msgs::PoseStampedConstPtr goal);
     void stateCallback(nav_msgs::OdometryConstPtr state);
     void flightModeCallback(uav_msgs::FlightModeRequestConstPtr req);
+    void fixedLaserCallback(sensor_msgs::LaserScanConstPtr scan);
+    void panningLaserCallback(sensor_msgs::LaserScanConstPtr scan);
     void visualizeTargetPose(geometry_msgs::PoseStamped p);
+    void visualizeCollisionPath(geometry_msgs::Pose pose, geometry_msgs::Pose target);
+    void visualizeCollisionVision(int start, int end, double angle_inc);
 
     UAVController controller;
     dynamic_reconfigure::Server<uav_local_planner::UAVControllerConfig> dynamic_reconfigure_server_;
@@ -63,6 +74,8 @@ private:
     double sizey_;
     double sizez_;
     double resolution_;
+
+    bool ignore_lasers_[720];
 
     std::string flt_mode_req_topic_;
     std::string flt_mode_stat_topic_;
@@ -73,17 +86,22 @@ private:
     std::string local_collision_topic_;
     std::string uav_state_topic_;
     std::string path_topic_;
+    std::string f_laser_topic_;
+    std::string p_laser_topic_;
 
     ros::Publisher waypoint_vis_pub_;
     ros::Publisher command_pub_;
     ros::Publisher RPYT_pub_;
     ros::Publisher status_pub_;
     ros::Publisher goal_pub_;
+    ros::Publisher rviz_pub_;
     ros::Subscriber collision_map_sub_;
     ros::Subscriber path_sub_;
     ros::Subscriber goal_sub_;
     ros::Subscriber state_sub_;
     ros::Subscriber flight_mode_sub_;
+    ros::Subscriber f_laser_sub_;
+    ros::Subscriber p_laser_sub_;
 
     nav_msgs::Path* controller_path_;
     nav_msgs::Path* latest_path_;
@@ -91,6 +109,7 @@ private:
     uav_msgs::FlightModeRequest flight_mode_;
     geometry_msgs::PoseStamped latest_goal_;
     nav_msgs::Odometry latest_state_;
+    sensor_msgs::LaserScan latest_scan_;
 
     boost::thread* controller_thread_;
     boost::mutex grid_mutex_;
