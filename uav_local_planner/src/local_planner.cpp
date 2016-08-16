@@ -28,6 +28,9 @@ UAVLocalPlanner::UAVLocalPlanner()
     local_collision_topic_ = "local_collision_map";
     uav_state_topic_ = "uav_state";
     path_topic_ = "path";
+    f_laser_topic_ = "fixed_laser";
+    p_laser_topic_ = "panning_laser";
+
 
     ROS_INFO("[local_planner] done getting params");
     path_idx_ = 0;
@@ -38,6 +41,7 @@ UAVLocalPlanner::UAVLocalPlanner()
     command_pub_ = nh.advertise<uav_msgs::ControllerCommand>(ctrl_cmd_topic_, 1);
     RPYT_pub_ = nh.advertise<uav_msgs::ControllerCommand>("RPYT_cmd", 1);
     goal_pub_ = nh.advertise<geometry_msgs::PoseStamped>(goal_pub_topic_, 1);
+    rviz_pub_ = nh.advertise<visualization_msgs::Marker>("collision_path", 1);
 
     status_pub_ = nh.advertise<uav_msgs::FlightModeStatus>(flt_mode_stat_topic_, 1);
 
@@ -58,6 +62,8 @@ UAVLocalPlanner::UAVLocalPlanner()
     goal_sub_ = nh.subscribe(goal_sub_topic_, 1, &UAVLocalPlanner::goalCallback, this);
     state_sub_ = nh.subscribe(uav_state_topic_, 1, &UAVLocalPlanner::stateCallback, this);
     flight_mode_sub_ = nh.subscribe(flt_mode_req_topic_, 1, &UAVLocalPlanner::flightModeCallback, this);
+    f_laser_sub_ = nh.subscribe(f_laser_topic_, 1, &UAVLocalPlanner::fixedLaserCallback, this);
+    p_laser_sub_ = nh.subscribe(p_laser_topic_, 1, &UAVLocalPlanner::panningLaserCallback, this);
 
     dynamic_reconfigure::Server<uav_local_planner::UAVControllerConfig>::CallbackType f;
     f = boost::bind(&UAVController::dynamic_reconfigure_callback, &controller, _1, _2);
@@ -65,6 +71,7 @@ UAVLocalPlanner::UAVLocalPlanner()
 
     double dx_prev_ = 0.0;
     double dy_prev_ = 0.0;
+    ignore_lasers_[44] = true; ignore_lasers_[675] = true;
 }
 
 UAVLocalPlanner::~UAVLocalPlanner()
@@ -142,7 +149,7 @@ void UAVLocalPlanner::controllerThread()
 //            hover_pose_.pose.orientation.w = 1;
             break;
         case uav_msgs::FlightModeStatus::HOVER:
-            ROS_INFO("[controller] state: HOVER");
+            //ROS_INFO("[controller] state: HOVER");
             u = hover(pose, velocity);
             break;
         case uav_msgs::FlightModeStatus::FOLLOWING:
@@ -254,7 +261,7 @@ uav_msgs::ControllerCommand UAVLocalPlanner::followPath(
         }
     }
 
-    ROS_WARN("size is %zu ", controller_path_->poses.size());
+    //ROS_WARN("size is %zu ", controller_path_->poses.size());
     double dx = pose.pose.position.x - controller_path_->poses[path_idx_].pose.position.x;
     double dy = pose.pose.position.y - controller_path_->poses[path_idx_].pose.position.y;
     double dz = pose.pose.position.z - controller_path_->poses[path_idx_].pose.position.z;
@@ -344,11 +351,94 @@ uav_msgs::ControllerCommand UAVLocalPlanner::followPath(
     // TODO: collision check the path from the target to the next few points (use a time horizon)
     const geometry_msgs::PoseStamped& target = controller_path_->poses[path_idx_];
     ROS_DEBUG("next target is %f %f %f", target.pose.position.x, target.pose.position.y, target.pose.position.z);
+    if(willCollide(pose.pose, target.pose)) {
+    	ROS_INFO("WILL COLLIDE!  SWITCHING TO HOVER!");
+    	flight_mode_.mode = uav_msgs::FlightModeRequest::HOVER;
+    	hover_pose_ = pose;
+    	return hover(pose, vel);
+    }
     visualizeTargetPose(target);
-
+    //visualizeCollisionPath(pose.pose, target.pose);
     uav_msgs::ControllerCommand u = controller.Controller(pose, vel, target);
     // TODO: collision check the controls for some very short period of time
     return u;
+}
+
+float inline UAVLocalPlanner::quad(float a, float b, float c) {
+	float d = b*b - 4 * a * c;
+	return std::max((-b + sqrt(d))/(2*a), (-b - sqrt(d))/(2*a));
+}
+
+bool UAVLocalPlanner::willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose target) {
+	//Grab the latest laser scan from the fixed laser
+	sensor_msgs::LaserScan scan = latest_scan_;
+	float angle_inc = scan.angle_increment;
+	double dx = target.position.x - pose.position.x;
+	double dy = target.position.y - pose.position.y;
+	float pathDistance = sqrt(dx*dx + dy*dy);
+	tf::Quaternion q;
+	tf::quaternionMsgToTF(pose.orientation, q);
+	double roll, pitch, yaw;
+	tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+	yaw = -yaw;
+	int FOV = 300; //laser scans
+	double offset; //Specifies the new focus of the laser checks
+	if(dx < 0) {
+		offset = -acos((dx)/pathDistance);
+		if(dy < 0)
+			offset = -offset;
+	}
+	else 
+		offset = -asin((dy)/pathDistance);
+
+	offset = (offset - (yaw - 3*PI/4.0)); //adjust focus with respect to the yaw
+	int start = offset/angle_inc - FOV/2; int end = start + FOV;
+	int firstSphereIntersect = (start+end)/2 - (PI/2 - atan(pathDistance/QUADRAD))/angle_inc;
+	int secondSphereIntersect = end - (firstSphereIntersect-start);
+	float curr_angle = (end-start)*angle_inc/2 + PI/2.0; //make it trig friendly
+	float miniumRange = 0.0;
+	//Unit-test visualization
+	visualization_msgs::Marker m;
+	m.header.frame_id = "body_frame";
+	m.header.stamp = ros::Time::now();
+	m.ns = "idklol";
+	m.type = visualization_msgs::Marker::POINTS;
+	m.id = 4;
+	m.lifetime = ros::Duration(5);
+	m.scale.x = 0.1; m.scale.y = 0.1;
+	m.color.r = 1.0; m.color.a = 1;
+
+	if(start < 0 || end >= scan.ranges.size()) {
+		ROS_INFO("NEXT WAYPOINT OUT OF LASER RANGE!");
+		return false; //or true?  Depends on if you want scrap metal
+	}
+	ROS_INFO("Path Distance: %f Offset: %f Start: %i, End: %i, firstIntersect: %i, secondIntersect: %i, curr_angle: %f angle_inc: %f", pathDistance, offset, start, end, firstSphereIntersect, secondSphereIntersect, curr_angle, angle_inc);
+	//Optimization:  Only check from the start to the middle as the pattern it checks for is symetric
+	for(int range = end; range >= start; range--) {
+		curr_angle -= angle_inc;
+		if(range < firstSphereIntersect || range > secondSphereIntersect) 
+			miniumRange = std::abs(QUADRAD/cos(curr_angle));
+		else {
+			miniumRange = std::abs(pathDistance/sin(curr_angle));
+			float z = pathDistance/tan(curr_angle);
+			float add = quad(1, 2*z*cos(curr_angle), z*z - QUADRAD*QUADRAD);
+			miniumRange += add;
+		}
+		geometry_msgs::Point p;
+		p.x = cos(3*(PI/4) - range*angle_inc)*miniumRange;
+		p.y = sin(3*(PI/4) - range*angle_inc)*miniumRange;
+		m.points.push_back(p);
+		//ToDo:  Add more background subtracting
+		if(scan.ranges[range] <= miniumRange && scan.ranges[range] >= 0.2) {
+			ROS_INFO("PROBLEM! actual range %f", scan.ranges[range]);
+			visualizeCollisionVision(start, end, angle_inc);
+			rviz_pub_.publish(m);
+			return true;
+		}
+	}
+	visualizeCollisionVision(start, end, angle_inc);
+	rviz_pub_.publish(m);
+	return false;
 }
 
 /***************** UPDATE FUNCTIONS *****************/
@@ -496,6 +586,14 @@ void UAVLocalPlanner::flightModeCallback(uav_msgs::FlightModeRequestConstPtr req
     ROS_DEBUG("[local_planner] flight mode request callback %f %f = %f", start_.toSec(), stop_.toSec(), stop_.toSec() - start_.toSec());
 }
 
+void UAVLocalPlanner::fixedLaserCallback(sensor_msgs::LaserScanConstPtr scan) {
+	latest_scan_ = *scan;
+}
+
+void UAVLocalPlanner::panningLaserCallback(sensor_msgs::LaserScanConstPtr scan) {
+	//ToDo:  Preform 3D collision checks here
+}
+
 /***************** VISUALIZATION *****************/
 
 void UAVLocalPlanner::visualizeTargetPose(geometry_msgs::PoseStamped p)
@@ -517,6 +615,82 @@ void UAVLocalPlanner::visualizeTargetPose(geometry_msgs::PoseStamped p)
     marker.id = 0;
     marker.lifetime = ros::Duration(0);
     waypoint_vis_pub_.publish(marker);
+}
+
+void UAVLocalPlanner::visualizeCollisionPath(geometry_msgs::Pose pose, geometry_msgs::Pose target) {
+	double distance = DISTANCE(pose.position.x, target.position.x, 
+							   pose.position.y, target.position.y,
+							   pose.position.z, target.position.z);
+	visualization_msgs::Marker marker;
+	marker.header.frame_id = "map";
+	marker.header.stamp = ros::Time::now();
+	marker.ns = "collision";
+	marker.id = 0;
+	marker.type = visualization_msgs::Marker::CYLINDER;
+	tf::Quaternion q; q.setRPY(0, 
+							   PI/2 - asin((target.position.z-pose.position.z)/distance), 
+							   atan((target.position.y-pose.position.y)/(target.position.x-pose.position.x)));
+	marker.pose.orientation.x = q.x();
+	marker.pose.orientation.y = q.y();
+	marker.pose.orientation.z = q.z();
+	marker.pose.orientation.w = q.w();
+	marker.pose.position.x = (pose.position.x + target.position.x)/2;
+	marker.pose.position.y = (pose.position.y + target.position.y)/2;
+	marker.pose.position.z = (pose.position.z + target.position.z)/2;
+	marker.scale.x = 1;
+    marker.scale.y = 1;
+    marker.scale.z = distance;
+	marker.color.r = 0.0f;
+	marker.color.g = 1.0f;
+	marker.color.b = 0.0f;
+	marker.color.a = 1;
+	marker.lifetime = ros::Duration(5);
+	rviz_pub_.publish(marker);
+	visualization_msgs::Marker sphere;
+	sphere.header.frame_id = "map";
+	sphere.header.stamp = ros::Time::now();
+	sphere.ns = "collision";
+	sphere.id = 1;
+	sphere.type = visualization_msgs::Marker::SPHERE;
+	sphere.pose.position.x = target.position.x;
+	sphere.pose.position.y = target.position.y;
+	sphere.pose.position.z = target.position.z;
+	sphere.scale.x = 0.5;
+	sphere.scale.y = 0.5;
+	sphere.scale.z = 0.5;
+	sphere.color = marker.color;
+	sphere.lifetime = ros::Duration(5);
+	rviz_pub_.publish(sphere);
+}
+
+void UAVLocalPlanner::visualizeCollisionVision(int start, int end, double angle_inc) {
+	visualization_msgs::Marker l1;
+	visualization_msgs::Marker l2;
+	l1.header.frame_id = l2.header.frame_id = "body_frame";
+	l1.header.stamp = l2.header.stamp = ros::Time::now();
+	l1.ns = l2.ns = "lines";
+	l1.id = 2; l2.id = 3;
+	l1.type = l2.type = visualization_msgs::Marker::LINE_STRIP;
+	l1.scale.x = l2.scale.x = 0.1;
+	l1.lifetime = l2.lifetime = ros::Duration(5);
+	l1.color.r = 1; l2.color.b = 1;
+	l1.color.a = l2.color.a = 1;
+	geometry_msgs::Point p; p.x = 0; p.y = 0; p.z = 0;
+	l1.points.push_back(p); l2.points.push_back(p);
+	double begin = 3*(PI/4) - start*angle_inc;
+	double stop = 3*(PI/4) - end*angle_inc;
+	geometry_msgs::Point q;
+	q.x = cos(begin)*10;
+	q.y = sin(begin)*10;
+	q.z = 0;
+	l1.points.push_back(q);
+	l1.points.push_back(p);
+	geometry_msgs::Point a;
+	a.x = cos(stop)*10;
+	a.y = sin(stop)*10;
+	a.z = 0;
+	l1.points.push_back(a);
+	rviz_pub_.publish(l1);
 }
 
 /***************** MAIN *****************/
