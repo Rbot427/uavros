@@ -364,11 +364,6 @@ uav_msgs::ControllerCommand UAVLocalPlanner::followPath(
     return u;
 }
 
-float inline UAVLocalPlanner::quad(float a, float b, float c) {
-	float d = b*b - 4 * a * c;
-	return std::max((-b + sqrt(d))/(2*a), (-b - sqrt(d))/(2*a));
-}
-
 bool UAVLocalPlanner::willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose target) {
 	//Grab the latest laser scan from the fixed laser
 	sensor_msgs::LaserScan scan = latest_scan_;
@@ -380,22 +375,23 @@ bool UAVLocalPlanner::willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose 
 	tf::quaternionMsgToTF(pose.orientation, q);
 	double roll, pitch, yaw;
 	tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
-	yaw = -yaw;
-	int FOV = 300; //laser scans
+
+	double FOV_rad = 1.965; //Field of view in radians
+	int FOV = FOV_rad/angle_inc;
 	double offset; //Specifies the new focus of the laser checks
 	if(dx < 0) {
-		offset = -acos((dx)/pathDistance);
+		offset = acos((dx)/pathDistance);
 		if(dy < 0)
 			offset = -offset;
 	}
 	else 
-		offset = -asin((dy)/pathDistance);
+		offset = asin((dy)/pathDistance);
 
 	offset = (offset - (yaw - 3*PI/4.0)); //adjust focus with respect to the yaw
-	int start = offset/angle_inc - FOV/2; int end = start + FOV;
+	int start = offset/angle_inc - FOV/2; int end = start + FOV; int focus = (start+end)/2;
 	int firstSphereIntersect = (start+end)/2 - (PI/2 - atan(pathDistance/QUADRAD))/angle_inc;
 	int secondSphereIntersect = end - (firstSphereIntersect-start);
-	float curr_angle = (end-start)*angle_inc/2 + PI/2.0; //make it trig friendly
+	float curr_angle = PI/2.0 - FOV*angle_inc/2; //make it trig friendly
 	float miniumRange = 0.0;
 	//Unit-test visualization
 	visualization_msgs::Marker m;
@@ -409,27 +405,35 @@ bool UAVLocalPlanner::willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose 
 	m.color.r = 1.0; m.color.a = 1;
 
 	if(start < 0 || end >= scan.ranges.size()) {
-		ROS_INFO("NEXT WAYPOINT OUT OF LASER RANGE!");
-		return false; //or true?  Depends on if you want scrap metal
+		ROS_WARN("NEXT WAYPOINT OUT OF LASER RANGE!");
+		return false; //or true if you want to be extra safe
 	}
-	ROS_INFO("Path Distance: %f Offset: %f Start: %i, End: %i, firstIntersect: %i, secondIntersect: %i, curr_angle: %f angle_inc: %f", pathDistance, offset, start, end, firstSphereIntersect, secondSphereIntersect, curr_angle, angle_inc);
-	//Optimization:  Only check from the start to the middle as the pattern it checks for is symetric
-	for(int range = end; range >= start; range--) {
-		curr_angle -= angle_inc;
+
+	//ROS_INFO("Path Distance: %f Offset: %f Start: %i, End: %i, firstIntersect: %i, secondIntersect: %i, curr_angle: %f angle_inc: %f", pathDistance, offset, start, end, firstSphereIntersect, secondSphereIntersect, curr_angle, angle_inc);
+
+	for(int range = start; range <= (start+end)/2; range++) {
+		curr_angle += angle_inc;
 		if(range < firstSphereIntersect || range > secondSphereIntersect) 
 			miniumRange = std::abs(QUADRAD/cos(curr_angle));
 		else {
 			miniumRange = std::abs(pathDistance/sin(curr_angle));
-			float z = pathDistance/tan(curr_angle);
-			float add = quad(1, 2*z*cos(curr_angle), z*z - QUADRAD*QUADRAD);
+			float z = sqrt(miniumRange*miniumRange - pathDistance*pathDistance);
+			float q = PI - curr_angle;
+			float w = asin(z*sin(q)/QUADRAD);
+			float g = PI - q - w;
+			float add = sin(g)*QUADRAD/sin(q);
+			ROS_INFO("minRange: %f, angle: %f, z: %f, q: %f, w: %f, g: %f", miniumRange, curr_angle, z, q, w, g);
 			miniumRange += add;
 		}
 		geometry_msgs::Point p;
-		p.x = cos(3*(PI/4) - range*angle_inc)*miniumRange;
-		p.y = sin(3*(PI/4) - range*angle_inc)*miniumRange;
+		p.x = cos(range*angle_inc - 3*(PI/4))*miniumRange;
+		p.y = sin(range*angle_inc - 3*(PI/4))*miniumRange;
 		m.points.push_back(p);
-		//ToDo:  Add more background subtracting
-		if(scan.ranges[range] <= miniumRange && scan.ranges[range] >= 0.2) {
+		p.x = cos((2*focus - range)*angle_inc - 3*(PI/4))*miniumRange;
+		p.y = sin((2*focus - range)*angle_inc - 3*(PI/4))*miniumRange;
+		m.points.push_back(p);
+		//ToDo:  Add better background subtracting
+		if((scan.ranges[range] <= miniumRange || scan.ranges[2*focus - range] <= miniumRange) && scan.ranges[range] >= 0.2) {
 			ROS_INFO("PROBLEM! actual range %f", scan.ranges[range]);
 			visualizeCollisionVision(start, end, angle_inc);
 			rviz_pub_.publish(m);
@@ -677,8 +681,8 @@ void UAVLocalPlanner::visualizeCollisionVision(int start, int end, double angle_
 	l1.color.a = l2.color.a = 1;
 	geometry_msgs::Point p; p.x = 0; p.y = 0; p.z = 0;
 	l1.points.push_back(p); l2.points.push_back(p);
-	double begin = 3*(PI/4) - start*angle_inc;
-	double stop = 3*(PI/4) - end*angle_inc;
+	double begin = start*angle_inc - 3*(PI/4);
+	double stop =  end*angle_inc - 3*(PI/4);
 	geometry_msgs::Point q;
 	q.x = cos(begin)*10;
 	q.y = sin(begin)*10;
