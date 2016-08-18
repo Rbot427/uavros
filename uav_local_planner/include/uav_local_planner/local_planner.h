@@ -54,7 +54,6 @@ private:
         geometry_msgs::PoseStamped& pose,
         geometry_msgs::TwistStamped& velocity);
 
-    float inline quad(float a, float b, float c);
     bool willCollide(geometry_msgs::Pose pose, geometry_msgs::Pose target);
 
     void pathCallback(nav_msgs::PathConstPtr path);
